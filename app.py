@@ -289,7 +289,7 @@ HTML_TEMPLATE = """
         }
 
         // Helper: parse workbook and render first N rows as HTML table
-        function renderExcelPreview(arrayBuffer, targetDiv, rowsToShow = 10) {
+        function renderExcelPreview(arrayBuffer, targetDiv, rowsToShow = 1000) {
             const workbook = XLSX.read(arrayBuffer, { type: 'array' });
             const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
             const data = XLSX.utils.sheet_to_json(firstSheet, { header: 1, defval: "" });
