@@ -181,56 +181,230 @@ def transform_in_memory(input_bytes):
 # ------------------------------------------------------------
 HTML_TEMPLATE = """
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Excel Transformer</title>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Excel Cleanup Tool | Transform your data</title>
+    <!-- Tailwind CSS + Font Awesome + SheetJS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <script src="https://cdn.sheetjs.com/xlsx-0.20.2/package/dist/xlsx.full.min.js"></script>
     <style>
-        body { font-family: sans-serif; margin: 2rem; }
-        input, button { font-size: 1rem; margin: 0.5rem 0; }
-        #status { margin-top: 1rem; font-style: italic; }
+        /* Custom smooth transitions */
+        .transition-all { transition: all 0.2s ease; }
+        .preview-table { overflow-x: auto; max-height: 300px; }
+        .preview-table table { min-width: 500px; }
+        .drag-over { background-color: #e0f2fe; border-color: #0284c7; }
     </style>
 </head>
-<body>
-    <h1>Excel Cleanup Tool</h1>
-    <p>Upload an Excel file (.xlsx) – get a transformed version back.</p>
-    <input type="file" id="fileInput" accept=".xlsx" />
-    <button onclick="transform()">Transform & Download</button>
-    <div id="status"></div>
+<body class="bg-gradient-to-br from-slate-50 to-slate-100 min-h-screen py-8 px-4">
+
+    <div class="max-w-6xl mx-auto">
+        <!-- Header -->
+        <div class="text-center mb-8">
+            <h1 class="text-4xl font-bold text-slate-800 mb-2">
+                <i class="fas fa-file-excel text-green-600 mr-2"></i>
+                Excel Cleanup Tool
+            </h1>
+            <p class="text-slate-600">Upload your Excel file → Preview → Transform → Preview → Download</p>
+        </div>
+
+        <!-- Main card -->
+        <div class="bg-white rounded-2xl shadow-xl overflow-hidden">
+            <div class="p-6 border-b border-slate-200">
+                <h2 class="text-xl font-semibold text-slate-700"><i class="fas fa-upload mr-2 text-blue-500"></i>1. Upload File</h2>
+            </div>
+            <div class="p-6">
+                <!-- Drag & drop area -->
+                <div id="dropzone" class="border-2 border-dashed border-slate-300 rounded-xl p-8 text-center cursor-pointer hover:border-blue-400 transition-all">
+                    <i class="fas fa-cloud-upload-alt text-5xl text-slate-400 mb-3"></i>
+                    <p class="text-slate-600 mb-2">Drag & drop your Excel file here, or <span class="text-blue-600 font-medium">click to browse</span></p>
+                    <p class="text-sm text-slate-400">Supports .xlsx, .xls</p>
+                    <input type="file" id="fileInput" accept=".xlsx,.xls" class="hidden" />
+                </div>
+
+                <!-- Upload preview section -->
+                <div id="uploadPreview" class="mt-6 hidden">
+                    <h3 class="font-medium text-slate-700 mb-2"><i class="fas fa-eye mr-1"></i> Uploaded file preview (first 10 rows)</h3>
+                    <div id="uploadTable" class="preview-table border rounded-lg p-2 bg-slate-50"></div>
+                </div>
+
+                <!-- Process button (hidden until file uploaded) -->
+                <div class="mt-6 text-center">
+                    <button id="processBtn" disabled class="bg-blue-500 hover:bg-blue-600 text-white font-semibold py-2 px-6 rounded-lg shadow-md transition-all disabled:opacity-50 disabled:cursor-not-allowed">
+                        <i class="fas fa-cogs mr-2"></i> Process File
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Result card (hidden initially) -->
+        <div id="resultCard" class="bg-white rounded-2xl shadow-xl overflow-hidden mt-8 hidden">
+            <div class="p-6 border-b border-slate-200">
+                <h2 class="text-xl font-semibold text-slate-700"><i class="fas fa-chalkboard-user mr-2 text-purple-500"></i>2. Transformed Preview</h2>
+            </div>
+            <div class="p-6">
+                <div id="resultPreview" class="preview-table border rounded-lg p-2 bg-slate-50"></div>
+                <div class="mt-6 text-center">
+                    <button id="downloadBtn" class="bg-green-500 hover:bg-green-600 text-white font-semibold py-2 px-6 rounded-lg shadow-md transition-all">
+                        <i class="fas fa-download mr-2"></i> Download Transformed Excel
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Loading overlay -->
+        <div id="loading" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 hidden">
+            <div class="bg-white rounded-xl p-8 text-center">
+                <i class="fas fa-spinner fa-spin text-4xl text-blue-500 mb-4"></i>
+                <p class="text-slate-700">Processing your file... (cold start may take 30-60s)</p>
+            </div>
+        </div>
+    </div>
 
     <script>
-        async function transform() {
-            const fileInput = document.getElementById('fileInput');
-            const file = fileInput.files[0];
-            if (!file) {
-                alert("Select an Excel file first");
+        // DOM elements
+        const dropzone = document.getElementById('dropzone');
+        const fileInput = document.getElementById('fileInput');
+        const uploadPreviewDiv = document.getElementById('uploadPreview');
+        const uploadTableDiv = document.getElementById('uploadTable');
+        const processBtn = document.getElementById('processBtn');
+        const resultCard = document.getElementById('resultCard');
+        const resultPreviewDiv = document.getElementById('resultPreview');
+        const downloadBtn = document.getElementById('downloadBtn');
+        const loadingDiv = document.getElementById('loading');
+
+        let uploadedFile = null;
+        let processedBlob = null;
+
+        // Helper: read file as array buffer
+        function readFileAsBuffer(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = (e) => resolve(e.target.result);
+                reader.onerror = reject;
+                reader.readAsArrayBuffer(file);
+            });
+        }
+
+        // Helper: parse workbook and render first N rows as HTML table
+        function renderExcelPreview(arrayBuffer, targetDiv, rowsToShow = 10) {
+            const workbook = XLSX.read(arrayBuffer, { type: 'array' });
+            const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+            const data = XLSX.utils.sheet_to_json(firstSheet, { header: 1, defval: "" });
+            if (!data || data.length === 0) {
+                targetDiv.innerHTML = '<p class="text-slate-500 italic">No data found.</p>';
                 return;
             }
-            const statusDiv = document.getElementById('status');
-            statusDiv.innerText = "Processing... (cold start may take 30-60s)";
+            const headers = data[0];
+            const rows = data.slice(1, rowsToShow + 1);
+            let html = '<table class="min-w-full text-sm">';
+            // header row
+            html += '<thead class="bg-slate-100"><tr>';
+            headers.forEach(h => {
+                html += `<th class="border px-2 py-1 text-left font-semibold">${escapeHtml(String(h))}</th>`;
+            });
+            html += '</tr></thead><tbody>';
+            rows.forEach(row => {
+                html += '<tr>';
+                headers.forEach((_, idx) => {
+                    let cell = row[idx] !== undefined ? row[idx] : "";
+                    html += `<td class="border px-2 py-1">${escapeHtml(String(cell))}</td>`;
+                });
+                html += '</tr>';
+            });
+            html += '</tbody></table>';
+            if (data.length > rowsToShow + 1) {
+                html += `<p class="text-xs text-slate-400 mt-1">... and ${data.length - rowsToShow - 1} more rows</p>`;
+            }
+            targetDiv.innerHTML = html;
+        }
+
+        function escapeHtml(str) {
+            return str.replace(/[&<>]/g, function(m) {
+                if (m === '&') return '&amp;';
+                if (m === '<') return '&lt;';
+                if (m === '>') return '&gt;';
+                return m;
+            });
+        }
+
+        // Handle file selection
+        function handleFile(file) {
+            if (!file || !(file.name.endsWith('.xlsx') || file.name.endsWith('.xls'))) {
+                alert('Please select a valid Excel file (.xlsx or .xls)');
+                return false;
+            }
+            uploadedFile = file;
+            // Show preview
+            readFileAsBuffer(file).then(buffer => {
+                renderExcelPreview(buffer, uploadTableDiv);
+                uploadPreviewDiv.classList.remove('hidden');
+                processBtn.disabled = false;
+            }).catch(err => {
+                console.error(err);
+                alert('Error reading file for preview');
+            });
+            return true;
+        }
+
+        // Drag & drop events
+        dropzone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropzone.classList.add('drag-over');
+        });
+        dropzone.addEventListener('dragleave', () => {
+            dropzone.classList.remove('drag-over');
+        });
+        dropzone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropzone.classList.remove('drag-over');
+            const file = e.dataTransfer.files[0];
+            handleFile(file);
+        });
+        dropzone.addEventListener('click', () => fileInput.click());
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length) handleFile(e.target.files[0]);
+        });
+
+        // Process button: send to /transform endpoint
+        processBtn.addEventListener('click', async () => {
+            if (!uploadedFile) return;
+            loadingDiv.classList.remove('hidden');
             const formData = new FormData();
-            formData.append('file', file);
+            formData.append('file', uploadedFile);
             try {
                 const response = await fetch('/transform', { method: 'POST', body: formData });
                 if (!response.ok) {
                     const errorText = await response.text();
                     throw new Error(errorText);
                 }
-                const blob = await response.blob();
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = 'transformed.xlsx';
-                document.body.appendChild(a);
-                a.click();
-                a.remove();
-                URL.revokeObjectURL(url);
-                statusDiv.innerText = "Done! File downloaded.";
+                processedBlob = await response.blob();
+                // Show preview of processed file
+                const buffer = await processedBlob.arrayBuffer();
+                renderExcelPreview(buffer, resultPreviewDiv);
+                resultCard.classList.remove('hidden');
             } catch (err) {
-                statusDiv.innerText = "Error: " + err.message;
+                alert('Processing failed: ' + err.message);
                 console.error(err);
+            } finally {
+                loadingDiv.classList.add('hidden');
             }
-        }
+        });
+
+        // Download button
+        downloadBtn.addEventListener('click', () => {
+            if (!processedBlob) return;
+            const url = URL.createObjectURL(processedBlob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'transformed.xlsx';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        });
     </script>
 </body>
 </html>
