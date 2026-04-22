@@ -226,7 +226,7 @@ HTML_TEMPLATE = """
 
                 <!-- Upload preview section -->
                 <div id="uploadPreview" class="mt-6 hidden">
-                    <h3 class="font-medium text-slate-700 mb-2"><i class="fas fa-eye mr-1"></i> Uploaded file preview (first 10 rows)</h3>
+                    <h3 class="font-medium text-slate-700 mb-2"><i class="fas fa-eye mr-1"></i> Uploaded file preview (first 1000 rows)</h3>
                     <div id="uploadTable" class="preview-table border rounded-lg p-2 bg-slate-50"></div>
                 </div>
 
