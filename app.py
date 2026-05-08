@@ -3,26 +3,51 @@ import io
 import tempfile
 import pandas as pd
 import numpy as np
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from openpyxl import load_workbook
+from openpyxl.styles import numbers
 from flask import Flask, request, render_template_string, send_file
 
 app = Flask(__name__)
 
 # ------------------------------------------------------------
-# Your EXACT transformation functions (copied from your script)
+# NEW / UPDATED transformation functions (based on latest code)
 # ------------------------------------------------------------
 def normalize(val):
+    """Convert value to stripped single-line string; NaN / None become empty string."""
     if val is None or (isinstance(val, float) and np.isnan(val)):
         return ""
-    return str(val).strip()
+    return str(val).replace("\r", " ").replace("\n", " ").strip()
+
+
+def money_to_decimal(val):
+    s = ''.join(c for c in str(val) if c.isdigit() or c == '.')
+    if not s:
+        raise InvalidOperation
+    return Decimal(s)
+
+
+def format_dates(df):
+    """Convert Start Date and End Date columns to M/D/YY format (string)."""
+    date_columns = ["Start Date", "End Date"]
+    for col in date_columns:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+            df[col] = df[col].apply(
+                lambda x: f"{x.month}/{x.day}/{str(x.year)[2:]}" if pd.notnull(x) else ""
+            )
+    return df
+
 
 def load_with_computed_offer(file_path, sheet_name=None):
-    # Step 1 — Load Excel with formula‑aware Offer column
+    """Read Excel, evaluate formulas in 'Offer' column, clean Sale/Reg Price."""
+    # Read all columns as strings first
     read_kwargs = {"dtype": str, "keep_default_na": False}
     if sheet_name:
         read_kwargs["sheet_name"] = sheet_name
     df = pd.read_excel(file_path, **read_kwargs)
 
+    # Open workbook with openpyxl to detect formulas
     wb = load_workbook(file_path, data_only=False)
     ws = wb.active if sheet_name is None else wb[sheet_name]
 
@@ -36,65 +61,82 @@ def load_with_computed_offer(file_path, sheet_name=None):
     for i in range(len(df)):
         excel_row = i + 2
         cell = ws.cell(row=excel_row, column=offer_col_idx)
-        if cell.data_type == 'f':
+
+        if cell.data_type == 'f':          # formula cell
             sale_str = df.loc[i, 'Sale Price']
             reg_str = df.loc[i, 'Reg Price']
             try:
-                sale = float(''.join(c for c in str(sale_str) if c.isdigit() or c == '.'))
-                reg = float(''.join(c for c in str(reg_str) if c.isdigit() or c == '.'))
-                diff = reg - sale
-                if diff == int(diff):
+                sale = money_to_decimal(sale_str)
+                reg = money_to_decimal(reg_str)
+                diff = (reg - sale).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+                if diff == diff.to_integral():
                     offer_text = f"Save ${int(diff)}"
                 else:
-                    offer_text = f"Save ${diff:.1f}".rstrip('0').rstrip('.')
-            except (ValueError, TypeError):
+                    offer_text = f"Save ${diff:.2f}".rstrip('0').rstrip('.')
+            except (ValueError, TypeError, InvalidOperation):
                 offer_text = None
         else:
             offer_text = cell.value if cell.value is not None else ''
+
         offer_values.append(normalize(offer_text))
 
     df['Offer'] = offer_values
 
+    # Clean currency symbols from Sale Price and Reg Price
     for col in ['Sale Price', 'Reg Price']:
         if col in df.columns:
             df[col] = df[col].astype(str).str.replace(r'[^0-9.]', '', regex=True)
             df[col] = df[col].str.strip()
+
     return df
+
 
 def sort_by_department(df):
     return df.sort_values(by="Department", key=lambda s: s.str.lower(), kind="mergesort").reset_index(drop=True)
 
+
 def insert_department_header_rows(df):
+    """Insert separator rows with 'Department Headers' = '<clean_dept>.eps'."""
     rows = []
     previous_department = None
+
     for _, row in df.iterrows():
         current_department = normalize(row["Department"])
         if current_department != previous_department:
             separator = {col: "" for col in df.columns}
-            separator["Department Headers"] = f"{current_department}.eps" if current_department else ".eps"
+            clean_department = current_department.replace(" ", "").replace("&", "")
+            separator["Department Headers"] = f"{clean_department}.eps" if clean_department else ".eps"
             rows.append(separator)
             previous_department = current_department
+
         data = row.to_dict()
         data["Department Headers"] = ""
         rows.append(data)
+
     return pd.DataFrame(rows, columns=df.columns)
+
 
 def map_sale_type_eps(df):
     df["Sale Type"] = df["Sale Type"].apply(lambda v: f"{normalize(v)}.eps" if normalize(v) else "")
     return df
 
+
 def process_offer(df):
+    """Split Offer column into Offer | $ | Offer Dollar | Offer Cents."""
     offer_idx = df.columns.get_loc("Offer")
     new_dollar = []
     new_offer_dollar = []
     new_offer_cents = []
     new_offer = []
+
     for val in df["Offer"]:
         original = normalize(val)
         if "$" in original:
             prefix, price = original.split("$", 1)
             price = price.strip()
-            if price.startswith("0."):
+            if price.startswith("0.") or price.startswith("."):
+                # Cents-only case (e.g., Save $0.99 or Save $.99)
                 digits_after_decimal = price.split(".", 1)[1]
                 new_offer.append(prefix)
                 new_dollar.append("")
@@ -115,16 +157,20 @@ def process_offer(df):
             new_dollar.append("")
             new_offer_dollar.append("")
             new_offer_cents.append("")
+
     df["Offer"] = new_offer
     df.insert(offer_idx + 1, "$", new_dollar)
     df.insert(offer_idx + 2, "Offer Dollar", new_offer_dollar)
     df.insert(offer_idx + 3, "Offer Cents", new_offer_cents)
     return df
 
+
 def process_sale_price(df):
+    """Split Sale Price into Sale Price | Sale Cents."""
     sp_idx = df.columns.get_loc("Sale Price")
     new_sale_price = []
     new_sale_cents = []
+
     for val in df["Sale Price"]:
         s = normalize(val)
         if s == "":
@@ -136,48 +182,133 @@ def process_sale_price(df):
         else:
             dollars, cents = s, "00"
         if len(cents) == 1:
-            cents = f"0{cents}"
+            cents = f"{cents}0"
         if dollars == "0":
             new_sale_price.append(cents)
             new_sale_cents.append("¢")
         else:
             new_sale_price.append(dollars)
             new_sale_cents.append(cents)
+
     df["Sale Price"] = new_sale_price
     df.insert(sp_idx + 1, "Sale Cents", new_sale_cents)
     return df
 
+
 def process_reg_price(df):
-    df["Reg Price"] = df["Reg Price"].apply(
-        lambda v: f"Reg Price ${normalize(v)}.00 |" if "." not in normalize(v) and normalize(v) else
-                  (f"Reg Price ${normalize(v)} |" if normalize(v) else "")
-    )
+    """Rewrite Reg Price as 'Reg Price $<value> |'."""
+    def _format(val):
+        s = normalize(val)
+        if s == "":
+            return ""
+        if "." not in s:
+            s = s + ".00"
+        return f"Reg Price ${s} |"
+
+    df["Reg Price"] = df["Reg Price"].apply(_format)
     return df
 
+
+def convert_pure_numbers(df):
+    """Convert any string that looks like a pure number to int/float."""
+    def to_number(val):
+        if not isinstance(val, str):
+            return val
+        stripped = val.strip()
+        if stripped == "":
+            return val
+        try:
+            num = Decimal(stripped)
+            if num == num.to_integral():
+                return int(num)
+            else:
+                return float(num)
+        except:
+            return val
+    return df.map(to_number)
+
+
+def apply_excel_number_formatting(excel_bytes):
+    """
+    Take raw Excel bytes (produced by df.to_excel), load with openpyxl,
+    apply number format to all numeric cells (int/float), and return new bytes.
+    """
+    wb = load_workbook(io.BytesIO(excel_bytes))
+    ws = wb.active
+
+    for row in range(2, ws.max_row + 1):
+        for col in range(1, ws.max_column + 1):
+            cell = ws.cell(row=row, column=col)
+            if isinstance(cell.value, (int, float)):
+                if isinstance(cell.value, int) or cell.value == int(cell.value):
+                    cell.number_format = numbers.FORMAT_NUMBER       # "0"
+                else:
+                    cell.number_format = numbers.FORMAT_NUMBER_00    # "0.00"
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output.read()
+
+
 def transform_in_memory(input_bytes):
+    """Complete in-memory transformation using the latest pipeline."""
+    # Write input to a temporary file (openpyxl needs a real path)
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp_in:
         tmp_in.write(input_bytes)
         tmp_in_path = tmp_in.name
-    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp_out:
-        tmp_out_path = tmp_out.name
+
     try:
+        # 1. Load with computed Offer and cleaned prices
         df = load_with_computed_offer(tmp_in_path)
+
+        # Verify required columns exist
+        required = ["Department", "Sale Type", "Offer", "Sale Price", "Reg Price"]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise ValueError(f"Missing required columns: {missing}")
+
+        # 2. Sort by Department
         df = sort_by_department(df)
+
+        # 3. Insert Department Headers column & separator rows
         df.insert(0, "Department Headers", "")
         df = insert_department_header_rows(df)
+
+        # 4. Append ".eps" to Sale Type
         df = map_sale_type_eps(df)
+
+        # 5. Split Offer
         df = process_offer(df)
+
+        # 6. Split Sale Price
         df = process_sale_price(df)
+
+        # 7. Format Reg Price
         df = process_reg_price(df)
-        df.to_excel(tmp_out_path, index=False, engine="openpyxl")
-        with open(tmp_out_path, "rb") as f:
-            return f.read()
+
+        # 8. Format Start/End Dates
+        df = format_dates(df)
+
+        # 9. Convert pure‑number strings to actual numbers
+        df = convert_pure_numbers(df)
+
+        # 10. Write DataFrame to Excel (raw, without number formats)
+        raw_excel_bytes = io.BytesIO()
+        df.to_excel(raw_excel_bytes, index=False, engine="openpyxl")
+        raw_excel_bytes.seek(0)
+
+        # 11. Apply Excel number formatting (0 and 0.00) to numeric cells
+        final_bytes = apply_excel_number_formatting(raw_excel_bytes.getvalue())
+
+        return final_bytes
+
     finally:
         os.unlink(tmp_in_path)
-        os.unlink(tmp_out_path)
+
 
 # ------------------------------------------------------------
-# Flask routes
+# Flask routes (unchanged HTML/JS)
 # ------------------------------------------------------------
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -191,7 +322,6 @@ HTML_TEMPLATE = """
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <script src="https://cdn.sheetjs.com/xlsx-0.20.2/package/dist/xlsx.full.min.js"></script>
     <style>
-        /* Custom smooth transitions */
         .transition-all { transition: all 0.2s ease; }
         .preview-table { overflow-x: auto; max-height: 300px; }
         .preview-table table { min-width: 500px; }
@@ -410,9 +540,11 @@ HTML_TEMPLATE = """
 </html>
 """
 
+
 @app.route("/")
 def index():
     return render_template_string(HTML_TEMPLATE)
+
 
 @app.route("/transform", methods=["POST"])
 def transform():
@@ -434,6 +566,7 @@ def transform():
     except Exception as e:
         app.logger.exception("Transformation failed")
         return f"Error: {str(e)}", 500
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
